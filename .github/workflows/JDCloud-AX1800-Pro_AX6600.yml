@@ -48,6 +48,7 @@ jobs:
 
     permissions:
       contents: write
+      releases: write # <--- 这一行是新增的，为了授权创建GitHub Release
 
     steps:
     - name: 检查项目分支

@@ -71,12 +71,7 @@ jobs:
     - name: 清理磁盘空间(Ubuntu)
       uses: jlumbroso/free-disk-space@main
       with:
-        # this might remove tools that are actually needed,
-        # when set to "true" but frees about 6 GB
         tool-cache: true
-        
-        # all of these default to true, but feel free to set to
-        # "false" if necessary for your workflow
         android: false
         dotnet: false
         haskell: false
@@ -107,7 +102,13 @@ jobs:
 
     - name: 加载config & DIY_P2_SH
       run: |
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        echo "DEBUG: Checking if $CONFIG_FILE exists before moving..."
+        if [ -e $CONFIG_FILE ]; then
+            mv $CONFIG_FILE openwrt/.config
+            echo "DEBUG: Moved $CONFIG_FILE to openwrt/.config"
+        else
+            echo "WARNING: Custom config file $CONFIG_FILE not found. make defconfig will generate a default one."
+        fi
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
@@ -130,6 +131,12 @@ jobs:
       run: |
         cd openwrt
         make defconfig
+        # 显式检查 .config 文件是否存在 after defconfig
+        if [ ! -f .config ]; then
+          echo "ERROR: .config file was not created after make defconfig! Aborting build."
+          exit 1
+        fi
+        echo "DEBUG: .config file found after make defconfig."
         make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -147,7 +154,6 @@ jobs:
         else
                 echo "BUILD_DOCKERMAN=" >> $GITHUB_ENV
         fi
-        # 确保 FILE_DATE 总是被设置，即使 make 命令失败了（尽管后面的if会阻止）
         echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV # 确保这行执行
         echo "status=success" >> $GITHUB_OUTPUT
         echo "DEBUG: FILE_DATE in compile step: ${{ env.FILE_DATE }}" # 添加调试信息
@@ -160,16 +166,27 @@ jobs:
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: | 
-        cd openwrt
+        echo "DEBUG: Current PWD before cd openwrt: $(pwd)"
+        echo "DEBUG: Listing contents of current PWD before cd openwrt:"
+        ls -la
+        cd openwrt || { echo "ERROR: Could not change directory to openwrt!"; exit 1; }
+        echo "DEBUG: Current PWD after cd openwrt: $(pwd)"
+        echo "DEBUG: Listing openwrt directory for .config presence:"
+        ls -la .config # 明确列出 .config 文件
+        if [ ! -f .config ]; then # 再次检查 .config 的存在
+          echo "ERROR: .config file not found in openwrt/ directory. This is critical for device detection."
+          exit 1
+        fi
         matched_lines=$(grep '^CONFIG_TARGET.*DEVICE_.*=y' .config | grep -v 'PER_DEVICE' | grep -v 'DEVICE_PACKAGES')
         mapfile -t devices < <(echo "$matched_lines" | sed -n 's/.*DEVICE_\([^=]*\)=y/\1/p')
-        cd bin/targets/*/*
+        cd bin/targets/*/* || { echo "ERROR: Could not change directory to bin/targets/*/!."; exit 1; }
         rm -rf packages
         for val in "${devices[@]}"; do
                 echo "Processing device: $val"
                 for file in *"${val}"*; do
                         if [ -f "$file" ]; then
                                 suffix="${file#*${val}}"
+                                # 修正 new_name 格式，避免以连字符开头
                                 new_name="${{ env.FILE_DATE }}-${{ env.OPENWRT_NAME }}-${val}${{ env.BUILD_DOCKERMAN }}${suffix}"
                                 mv "$file" "$new_name"
                                 echo "  Renamed: $file -> $new_name"
@@ -212,10 +229,6 @@ jobs:
         _UPLOAD_TAG_NAME="${{ env.UPLOAD_TAG_NAME }}"
         _BUILD_DOCKERMAN="${{ env.BUILD_DOCKERMAN }}"
 
-        # 确保标签不以连字符开头
-        # 格式: DATE-OPENWRT_NAME-UPLOAD_TAG_NAME[BUILD_DOCKERMAN_SUFFIX]
-        # 这里使用 format 来拼接，避免因变量为空导致多余的连字符
-        # 实际的 tag_name 应该是类似 '2023.10.26-1030-lede-jdcloud-ax1800-pro_ax6600-docker'
         RELEASE_TAG="${_FILE_DATE}-${_OPENWRT_NAME}-${_UPLOAD_TAG_NAME}${_BUILD_DOCKERMAN}"
 
         echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
@@ -229,7 +242,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         files: ${{ env.FIRMWARE }}/*
-        # 确保 name 和 tag_name 都使用由 id:tag 步骤生成的有效标签
-        name: ${{ steps.tag.outputs.release_tag }} # <-- 修改此处，使用正确的 release_tag
+        name: ${{ steps.tag.outputs.release_tag }}
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt

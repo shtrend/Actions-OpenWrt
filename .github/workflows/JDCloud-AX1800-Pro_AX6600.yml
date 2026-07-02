@@ -96,8 +96,26 @@ jobs:
       run: |
         cp JDCloud-AX1800-Pro_AX6600/jdcloud-ax1800-pro_ax6600.patch openwrt/jdcloud-ax1800-pro_ax6600.patch
         cd openwrt
-        # 尝试应用patch，如果失败则继续（可能源码版本已更新）
-        git apply jdcloud-ax1800-pro_ax6600.patch || echo "WARNING: Patch application failed, but continuing..."
+        # 首先尝试三路合并应用补丁（if possible）
+        if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
+          echo "Patch applied with --3way"
+        else
+          echo "git apply --3way failed, trying plain git apply"
+          if git apply jdcloud-ax1800-pro_ax6600.patch; then
+            echo "Patch applied with git apply"
+          else
+            echo "git apply failed, attempting git apply --reject to generate .rej files"
+            git apply --reject jdcloud-ax1800-pro_ax6600.patch || echo "git apply --reject also failed"
+            # 如果仓库里提供了 overrides 目录（包含目标文件），则作为最后手段覆盖 upstream 文件
+            if [ -d "$GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides" ]; then
+              echo "Applying overrides from repository to openwrt source..."
+              cp -rv $GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides/* .
+              git add -A
+              git commit -m "ci: apply overrides for jdcloud devices" || echo "no changes to commit"
+            fi
+            echo "WARNING: Patch application failed, but continuing..."
+          fi
+        fi
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 

@@ -1,4 +1,4 @@
-#
+# 
 # Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
 #
 # This is free software, licensed under the MIT License.
@@ -173,7 +173,7 @@ jobs:
         else
                 echo "BUILD_DOCKERMAN=" >> $GITHUB_ENV
         fi
-        echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV # 确保这行执行
+        echo "FILE_DATE=$(date +\"%Y.%m.%d-%H%M\")" >> $GITHUB_ENV # 确保这行执行
         echo "status=success" >> $GITHUB_OUTPUT
         echo "DEBUG: FILE_DATE in compile step: ${{ env.FILE_DATE }}" # 添加调试信息
 

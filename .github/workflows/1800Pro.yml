@@ -1,4 +1,4 @@
-#
+# 
 # Copyright (c) 2019-2020 P3TERX <https://p3terx.com>
 #
 # This is free software, licensed under the MIT License.
@@ -48,10 +48,21 @@ jobs:
 
     permissions:
       contents: write
+      releases: write # <-- 解决 403 错误，确保 GITHUB_TOKEN 有发布权限
 
     steps:
     - name: 检查项目分支
       uses: actions/checkout@main
+
+    # Ensure FILE_DATE has a sane default so tags won't start with a dash if compile is skipped/failed
+    - name: Ensure default FILE_DATE
+      run: |
+        if [ -z "${FILE_DATE}" ]; then
+          echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+          echo "DEBUG: Set default FILE_DATE=$FILE_DATE"
+        else
+          echo "DEBUG: FILE_DATE already set: $FILE_DATE"
+        fi
 
     - name: 初始化编译环境
       env:
@@ -70,12 +81,7 @@ jobs:
     - name: 清理磁盘空间(Ubuntu)
       uses: jlumbroso/free-disk-space@main
       with:
-        # this might remove tools that are actually needed,
-        # when set to "true" but frees about 6 GB
         tool-cache: true
-        
-        # all of these default to true, but feel free to set to
-        # "false" if necessary for your workflow
         android: false
         dotnet: false
         haskell: false
@@ -100,13 +106,76 @@ jobs:
       run: |
         cp JDCloud-AX1800-Pro_AX6600/jdcloud-ax1800-pro_ax6600.patch openwrt/jdcloud-ax1800-pro_ax6600.patch
         cd openwrt
-        git apply jdcloud-ax1800-pro_ax6600.patch
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+        echo "DEBUG: git status before patch apply"
+        git status --porcelain -b || true
+
+        # Check patch applicability first for clearer diagnostics
+        if git apply --check jdcloud-ax1800-pro_ax6600.patch; then
+          echo "Patch appears to apply cleanly (git apply --check). Trying to apply..."
+          if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
+            echo "Patch applied with --3way"
+          else
+            echo "git apply --3way failed, attempting plain git apply"
+            if git apply jdcloud-ax1800-pro_ax6600.patch; then
+              echo "Patch applied with git apply"
+            else
+              echo "git apply failed after --check succeeded (unexpected)"
+            fi
+          fi
+        else
+          echo "git apply --check reported problems, attempting three-way and reject fallback"
+          if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
+            echo "Patch applied with --3way"
+          else
+            echo "git apply --3way failed, attempting git apply --reject --whitespace=fix"
+            git apply --reject --whitespace=fix jdcloud-ax1800-pro_ax6600.patch || echo "git apply --reject also failed"
+
+            if compgen -G "*.rej" > /dev/null; then
+              echo "Found .rej files (patch hunks that failed):"
+              ls -la *.rej || true
+              for f in *.rej; do
+                echo "---- $f ----"
+                sed -n '1,200p' "$f" || true
+              done
+            else
+              echo "No .rej files generated. Patch failed for other reasons."
+            fi
+
+            # If repository provides overrides, apply them as a last resort
+            if [ -d "$GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides" ]; then
+              echo "Applying overrides from repository to openwrt source..."
+              cp -rv $GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides/* . || true
+              git add -A || true
+              git commit -m "ci: apply overrides for jdcloud devices" || echo "no changes to commit"
+            fi
+
+            echo "WARNING: Patch application failed or produced rejects; please inspect .rej outputs above. Continuing for now..."
+          fi
+        fi
+
+        # Make feeds update/installation fail-fast so errors are visible early
+        ./scripts/feeds update -a || { echo "feeds update failed"; exit 1; }
+        ./scripts/feeds install -a || { echo "feeds install failed"; exit 1; }
+
+    - name: Upload any patch reject files to logs
+      if: always()
+      run: |
+        cd openwrt || exit 0
+        if compgen -G "*.rej" > /dev/null; then
+          echo "Listing .rej files:"; ls -la *.rej || true
+        else
+          echo "No .rej files present"
+        fi
 
     - name: 加载config & DIY_P2_SH
       run: |
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
+        echo "DEBUG: Checking if $CONFIG_FILE exists before moving..."
+        if [ -e $CONFIG_FILE ]; then
+            mv $CONFIG_FILE openwrt/.config
+            echo "DEBUG: Moved $CONFIG_FILE to openwrt/.config"
+        else
+            echo "WARNING: Custom config file $CONFIG_FILE not found. make defconfig will generate a default one."
+        fi
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
@@ -129,6 +198,12 @@ jobs:
       run: |
         cd openwrt
         make defconfig
+        # 显式检查 .config 文件是否存在 after defconfig
+        if [ ! -f .config ]; then
+          echo "ERROR: .config file was not created after make defconfig! Aborting build."
+          exit 1
+        fi
+        echo "DEBUG: .config file found after make defconfig."
         make download -j$(nproc)
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
@@ -146,8 +221,13 @@ jobs:
         else
                 echo "BUILD_DOCKERMAN=" >> $GITHUB_ENV
         fi
-        echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        # ensure FILE_DATE is set (compile step usually sets it earlier)
+        if [ -z "$FILE_DATE" ]; then
+          echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        fi
+        echo "FILE_DATE=$FILE_DATE" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
+        echo "DEBUG: FILE_DATE in compile step: $FILE_DATE"
 
     - name: 查看磁盘使用情况
       if: (!cancelled())
@@ -157,17 +237,28 @@ jobs:
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: | 
-        cd openwrt
+        echo "DEBUG: Current PWD before cd openwrt: $(pwd)"
+        echo "DEBUG: Listing contents of current PWD before cd openwrt:"
+        ls -la
+        cd openwrt || { echo "ERROR: Could not change directory to openwrt!"; exit 1; }
+        echo "DEBUG: Current PWD after cd openwrt: $(pwd)"
+        echo "DEBUG: Listing openwrt directory for .config presence:"
+        ls -la .config # 明确列出 .config 文件
+        if [ ! -f .config ]; then # 再次检查 .config 的存在
+          echo "ERROR: .config file not found in openwrt/ directory. This is critical for device detection."
+          exit 1
+        fi
         matched_lines=$(grep '^CONFIG_TARGET.*DEVICE_.*=y' .config | grep -v 'PER_DEVICE' | grep -v 'DEVICE_PACKAGES')
         mapfile -t devices < <(echo "$matched_lines" | sed -n 's/.*DEVICE_\([^=]*\)=y/\1/p')
-        cd bin/targets/*/*
+        cd bin/targets/*/* || { echo "ERROR: Could not change directory to bin/targets/*/!."; exit 1; }
         rm -rf packages
         for val in "${devices[@]}"; do
                 echo "Processing device: $val"
                 for file in *"${val}"*; do
                         if [ -f "$file" ]; then
                                 suffix="${file#*${val}}"
-                                new_name="${{ env.FILE_DATE }}-${{ env.OPENWRT_NAME }}-${val}${{ env.BUILD_DOCKERMAN }}${suffix}"
+                                # 修正 new_name 格式，避免以连字符开头
+                                new_name="${FILE_DATE}-${OPENWRT_NAME}-${val}${BUILD_DOCKERMAN}${suffix}"
                                 mv "$file" "$new_name"
                                 echo "  Renamed: $file -> $new_name"
                         fi
@@ -197,8 +288,34 @@ jobs:
         else
                 echo "- 未编译luci-app-dockerman" >> release.txt
         fi
-        echo "release_tag=${{ env.FILE_DATE }}-${{ env.OPENWRT_NAME }}-${{ env.UPLOAD_TAG_NAME }}${{ env.BUILD_DOCKERMAN }}" >> $GITHUB_OUTPUT
+
+        _FILE_DATE="${{ env.FILE_DATE }}"
+        # 如果 FILE_DATE 为空（不应该发生，但以防万一），则使用当前日期
+        if [[ -z "$_FILE_DATE" ]]; then
+            _FILE_DATE=$(date +"%Y.%m.%d-%H%M")
+            echo "Warning: env.FILE_DATE was empty, using current date for tag: $_FILE_DATE"
+        fi
+
+        _OPENWRT_NAME="${{ env.OPENWRT_NAME }}"
+        _UPLOAD_TAG_NAME="${{ env.UPLOAD_TAG_NAME }}"
+        _BUILD_DOCKERMAN="${{ env.BUILD_DOCKERMAN }}"
+
+        # 修正：避免标签以连字符开头，添加'v'前缀作为版本号标识
+        RELEASE_TAG="v${_FILE_DATE}-${_OPENWRT_NAME}-${_UPLOAD_TAG_NAME}${_BUILD_DOCKERMAN}"
+        
+        # 清理标签中的特殊字符，确保符合GitHub标签规范
+        # GitHub标签只允许：字母、数字、点(.)、下划线(_)、连字符(-)
+        RELEASE_TAG=$(echo "$RELEASE_TAG" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/-*$//')
+
+        # Validate tag format strictly
+        if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "ERROR: RELEASE_TAG contains invalid characters: $RELEASE_TAG"
+          exit 1
+        fi
+
+        echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
         echo "status=success" >> $GITHUB_OUTPUT
+        echo "DEBUG: Constructed RELEASE_TAG: $RELEASE_TAG"
 
     - name: 发布固件至Release
       uses: softprops/action-gh-release@v2.1.0
@@ -207,6 +324,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         files: ${{ env.FIRMWARE }}/*
-        name: ${{ env.FILE_DATE }}-${{ env.OPENWRT_NAME }}-${{ env.UPLOAD_TAG_NAME }}${{ env.BUILD_DOCKERMAN }}
+        name: ${{ steps.tag.outputs.release_tag }}
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt

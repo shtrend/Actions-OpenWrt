@@ -48,11 +48,20 @@ jobs:
 
     permissions:
       contents: write
-      releases: write # <-- 解决 403 错误，确保 GITHUB_TOKEN 有发布权限
 
     steps:
     - name: 检查项目分支
       uses: actions/checkout@main
+
+    # Ensure FILE_DATE has a sane default so tags won't start with a dash if compile is skipped/failed
+    - name: Ensure default FILE_DATE
+      run: |
+        if [ -z "${FILE_DATE}" ]; then
+          echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+          echo "DEBUG: Set default FILE_DATE=$FILE_DATE"
+        else
+          echo "DEBUG: FILE_DATE already set: $FILE_DATE"
+        fi
 
     - name: 初始化编译环境
       env:
@@ -96,28 +105,66 @@ jobs:
       run: |
         cp JDCloud-AX1800-Pro_AX6600/jdcloud-ax1800-pro_ax6600.patch openwrt/jdcloud-ax1800-pro_ax6600.patch
         cd openwrt
-        # 首先尝试三路合并应用补丁（if possible）
-        if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
-          echo "Patch applied with --3way"
-        else
-          echo "git apply --3way failed, trying plain git apply"
-          if git apply jdcloud-ax1800-pro_ax6600.patch; then
-            echo "Patch applied with git apply"
+        echo "DEBUG: git status before patch apply"
+        git status --porcelain -b || true
+
+        # Check patch applicability first for clearer diagnostics
+        if git apply --check jdcloud-ax1800-pro_ax6600.patch; then
+          echo "Patch appears to apply cleanly (git apply --check). Trying to apply..."
+          if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
+            echo "Patch applied with --3way"
           else
-            echo "git apply failed, attempting git apply --reject to generate .rej files"
-            git apply --reject jdcloud-ax1800-pro_ax6600.patch || echo "git apply --reject also failed"
-            # 如果仓库里提供了 overrides 目录（包含目标文件），则作为最后手段覆盖 upstream 文件
+            echo "git apply --3way failed, attempting plain git apply"
+            if git apply jdcloud-ax1800-pro_ax6600.patch; then
+              echo "Patch applied with git apply"
+            else
+              echo "git apply failed after --check succeeded (unexpected)"
+            fi
+          fi
+        else
+          echo "git apply --check reported problems, attempting three-way and reject fallback"
+          if git apply --3way jdcloud-ax1800-pro_ax6600.patch; then
+            echo "Patch applied with --3way"
+          else
+            echo "git apply --3way failed, attempting git apply --reject --whitespace=fix"
+            git apply --reject --whitespace=fix jdcloud-ax1800-pro_ax6600.patch || echo "git apply --reject also failed"
+
+            if compgen -G "*.rej" > /dev/null; then
+              echo "Found .rej files (patch hunks that failed):"
+              ls -la *.rej || true
+              for f in *.rej; do
+                echo "---- $f ----"
+                sed -n '1,200p' "$f" || true
+              done
+            else
+              echo "No .rej files generated. Patch failed for other reasons."
+            fi
+
+            # If repository provides overrides, apply them as a last resort
             if [ -d "$GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides" ]; then
               echo "Applying overrides from repository to openwrt source..."
-              cp -rv $GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides/* .
-              git add -A
+              cp -rv $GITHUB_WORKSPACE/JDCloud-AX1800-Pro_AX6600/overrides/* . || true
+              git add -A || true
               git commit -m "ci: apply overrides for jdcloud devices" || echo "no changes to commit"
             fi
-            echo "WARNING: Patch application failed, but continuing..."
+
+            echo "WARNING: Patch application failed or produced rejects; please inspect .rej outputs above. Continuing for now..."
           fi
         fi
-        ./scripts/feeds update -a
-        ./scripts/feeds install -a
+
+        # Make feeds update/installation fail-fast so errors are visible early
+        ./scripts/feeds update -a || { echo "feeds update failed"; exit 1; }
+        ./scripts/feeds install -a || { echo "feeds install failed"; exit 1; }
+
+    - name: Upload any patch reject files to logs
+      if: always()
+      run: |
+        cd openwrt || exit 0
+        if compgen -G "*.rej" > /dev/null; then
+          echo "Listing .rej files:"; ls -la *.rej || true
+        else
+          echo "No .rej files present"
+        fi
 
     - name: 加载config & DIY_P2_SH
       run: |
@@ -173,9 +220,13 @@ jobs:
         else
                 echo "BUILD_DOCKERMAN=" >> $GITHUB_ENV
         fi
-        echo "FILE_DATE=$(date +\"%Y.%m.%d-%H%M\")" >> $GITHUB_ENV # 确保这行执行
+        # ensure FILE_DATE is set (compile step usually sets it earlier)
+        if [ -z "$FILE_DATE" ]; then
+          echo "FILE_DATE=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_ENV
+        fi
+        echo "FILE_DATE=$FILE_DATE" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "DEBUG: FILE_DATE in compile step: ${{ env.FILE_DATE }}" # 添加调试信息
+        echo "DEBUG: FILE_DATE in compile step: $FILE_DATE"
 
     - name: 查看磁盘使用情况
       if: (!cancelled())
@@ -206,7 +257,7 @@ jobs:
                         if [ -f "$file" ]; then
                                 suffix="${file#*${val}}"
                                 # 修正 new_name 格式，避免以连字符开头
-                                new_name="${{ env.FILE_DATE }}-${{ env.OPENWRT_NAME }}-${val}${{ env.BUILD_DOCKERMAN }}${suffix}"
+                                new_name="${FILE_DATE}-${OPENWRT_NAME}-${val}${BUILD_DOCKERMAN}${suffix}"
                                 mv "$file" "$new_name"
                                 echo "  Renamed: $file -> $new_name"
                         fi
@@ -255,9 +306,15 @@ jobs:
         # GitHub标签只允许：字母、数字、点(.)、下划线(_)、连字符(-)
         RELEASE_TAG=$(echo "$RELEASE_TAG" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/-*$//')
 
+        # Validate tag format strictly
+        if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9._-]+$ ]]; then
+          echo "ERROR: RELEASE_TAG contains invalid characters: $RELEASE_TAG"
+          exit 1
+        fi
+
         echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
         echo "status=success" >> $GITHUB_OUTPUT
-        echo "DEBUG: Constructed RELEASE_TAG: $RELEASE_TAG" # 添加调试信息
+        echo "DEBUG: Constructed RELEASE_TAG: $RELEASE_TAG"
 
     - name: 发布固件至Release
       uses: softprops/action-gh-release@v2.1.0

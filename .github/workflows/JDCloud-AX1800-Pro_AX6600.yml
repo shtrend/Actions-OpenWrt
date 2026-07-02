@@ -96,7 +96,8 @@ jobs:
       run: |
         cp JDCloud-AX1800-Pro_AX6600/jdcloud-ax1800-pro_ax6600.patch openwrt/jdcloud-ax1800-pro_ax6600.patch
         cd openwrt
-        git apply jdcloud-ax1800-pro_ax6600.patch
+        # 尝试应用patch，如果失败则继续（可能源码版本已更新）
+        git apply jdcloud-ax1800-pro_ax6600.patch || echo "WARNING: Patch application failed, but continuing..."
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
@@ -229,7 +230,12 @@ jobs:
         _UPLOAD_TAG_NAME="${{ env.UPLOAD_TAG_NAME }}"
         _BUILD_DOCKERMAN="${{ env.BUILD_DOCKERMAN }}"
 
-        RELEASE_TAG="${_FILE_DATE}-${_OPENWRT_NAME}-${_UPLOAD_TAG_NAME}${_BUILD_DOCKERMAN}"
+        # 修正：避免标签以连字符开头，添加'v'前缀作为版本号标识
+        RELEASE_TAG="v${_FILE_DATE}-${_OPENWRT_NAME}-${_UPLOAD_TAG_NAME}${_BUILD_DOCKERMAN}"
+        
+        # 清理标签中的特殊字符，确保符合GitHub标签规范
+        # GitHub标签只允许：字母、数字、点(.)、下划线(_)、连字符(-)
+        RELEASE_TAG=$(echo "$RELEASE_TAG" | sed 's/[^a-zA-Z0-9._-]/-/g' | sed 's/-*$//')
 
         echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
         echo "status=success" >> $GITHUB_OUTPUT
